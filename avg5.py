@@ -1,4 +1,5 @@
 import time
+from typing import List, Dict, Union, Callable
 
 import polars as pl
 import os
@@ -6,15 +7,44 @@ import ray
 
 # **单个文件的处理逻辑**
 @ray.remote
-def process_single_file(file_path, group_columns, sum_columns, mean_columns):
-    df = pl.scan_csv(file_path)  # 使用惰性读取，提高性能
-
+def process_single_file(
+    file_path, 
+    group_columns, 
+    sum_columns, 
+    mean_columns, 
+    filter_conditions: List[Dict[str, Union[str, Callable]]] = None
+):
+    # 使用惰性读取
+    df = pl.scan_csv(file_path)
+    
+    # 应用过滤条件
+    if filter_conditions:
+        for condition in filter_conditions:
+            column = condition['column']
+            op = condition.get('op', '==')
+            value = condition['value']
+            
+            # 根据不同操作符应用过滤
+            if op == '==':
+                df = df.filter(pl.col(column) == value)
+            elif op == '>=':
+                df = df.filter(pl.col(column) >= value)
+            elif op == '<=':
+                df = df.filter(pl.col(column) <= value)
+            elif op == '>':
+                df = df.filter(pl.col(column) > value)
+            elif op == '<':
+                df = df.filter(pl.col(column) < value)
+            elif callable(op):
+                # 支持自定义过滤函数
+                df = df.filter(pl.col(column).map(op))
+    
     # 计算需要求和的列
     grouped_sum = df.group_by(group_columns).agg(
         [pl.sum(col).alias(col) for col in sum_columns]
     )
 
-    # 需要求总体平均的列，在计算单个文件的时候，需要返回列的和，以及列的个数，用于后面的汇总计算
+    # 需要求总体平均的列
     grouped_weighted = df.group_by(group_columns).agg(
         [pl.sum(col).alias(col + "总分") for col in mean_columns] +
         [pl.count().alias("count")]
@@ -24,13 +54,25 @@ def process_single_file(file_path, group_columns, sum_columns, mean_columns):
 
 
 # **多进程 处理所有文件**
-def process_files_separately(directory, group_columns, sum_columns, mean_columns):
+def process_files_separately(
+    directory, 
+    group_columns, 
+    sum_columns, 
+    mean_columns, 
+    filter_conditions: List[Dict[str, Union[str, Callable]]] = None
+):
     files = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith(".csv")]
 
     # 使用 Ray 并行计算
     results = ray.get(
-        [process_single_file.remote(file, group_columns, sum_columns, mean_columns) for file in
-         files])
+        [process_single_file.remote(
+            file, 
+            group_columns, 
+            sum_columns, 
+            mean_columns, 
+            filter_conditions
+        ) for file in files]
+    )
 
     # 拆分结果
     partial_sum_results, partial_weighted_results = zip(*results)
@@ -51,9 +93,37 @@ def process_files_separately(directory, group_columns, sum_columns, mean_columns
 
 
 # **一次性 读取所有文件计算**
-def process_all_at_once(directory, group_columns, sum_columns, mean_columns):
+def process_all_at_once(
+    directory, 
+    group_columns, 
+    sum_columns, 
+    mean_columns, 
+    filter_conditions: List[Dict[str, Union[str, Callable]]] = None
+):
     all_data = [pl.read_csv(os.path.join(directory, f)) for f in os.listdir(directory) if f.endswith(".csv")]
     full_df = pl.concat(all_data)
+    
+    # 应用过滤条件
+    if filter_conditions:
+        for condition in filter_conditions:
+            column = condition['column']
+            op = condition.get('op', '==')
+            value = condition['value']
+            
+            # 根据不同操作符应用过滤
+            if op == '==':
+                full_df = full_df.filter(pl.col(column) == value)
+            elif op == '>=':
+                full_df = full_df.filter(pl.col(column) >= value)
+            elif op == '<=':
+                full_df = full_df.filter(pl.col(column) <= value)
+            elif op == '>':
+                full_df = full_df.filter(pl.col(column) > value)
+            elif op == '<':
+                full_df = full_df.filter(pl.col(column) < value)
+            elif callable(op):
+                # 支持自定义过滤函数
+                full_df = full_df.filter(pl.col(column).map(op))
 
     # **计算需要求和的列**
     sum_result = full_df.group_by(group_columns).agg(
@@ -122,6 +192,7 @@ class MyDataFrame:
         self.group_columns = []
         self.sum_columns = []
         self.mean_columns = []
+        self.filter_conditions = []  # 新增过滤条件列表
         
         # 使用MyRayContext管理Ray上下文
         self.ray_context = MyRayContext()
@@ -165,9 +236,29 @@ class MyDataFrame:
         self.mean_columns = columns
         return self
     
+    def filter(self, column, op='==', value=None):
+        """
+        添加过滤条件
+        
+        Args:
+            column (str): 要过滤的列名
+            op (str, optional): 比较操作符，默认为'=='
+            value (Any, optional): 比较的值
+        
+        Returns:
+            self: 返回当前对象，支持链式调用
+        """
+        condition = {
+            'column': column,
+            'op': op,
+            'value': value
+        }
+        self.filter_conditions.append(condition)
+        return self
+    
     def compute(self, method='separate'):
         """
-        触发计算并返回结果
+        触发计算并返回结果，支持过滤条件
         
         Args:
             method (str, optional): 计算方法，可选 'separate' 或 'all_at_once'
@@ -183,14 +274,16 @@ class MyDataFrame:
                 self.directory, 
                 self.group_columns, 
                 self.sum_columns, 
-                self.mean_columns
+                self.mean_columns,
+                self.filter_conditions  # 传递过滤条件
             ).sort(self.group_columns)
         elif method == 'all_at_once':
             result = process_all_at_once(
                 self.directory, 
                 self.group_columns, 
                 self.sum_columns, 
-                self.mean_columns
+                self.mean_columns,
+                self.filter_conditions  # 传递过滤条件
             ).sort(self.group_columns)
         else:
             raise ValueError("method必须是 'separate' 或 'all_at_once'")
@@ -215,27 +308,36 @@ if __name__ == "__main__":
         # 使用新的MyDataFrame
         df = MyDataFrame(output_dir)
         
-        # 链式调用配置
+        # 链式调用：分组、过滤、求和、求平均
         result_separate = (df.groupBy(["省份", "班级"])
-                             .sum(["语文", "数学"])
-                             .mean(["化学", "生物", "地理"])
-                             .compute(method='separate'))
+                    .filter("语文", ">=", 0)  # 过滤语文成绩大于等于60的记录
+                    .sum(["语文", "数学"])
+                    .mean(["化学", "生物", "地理"])
+                    .compute(method='separate'))
         
+
         result_all_at_once = (df.groupBy(["省份", "班级"])
-                                 .sum(["语文", "数学"])
-                                 .mean(["化学", "生物", "地理"])
-                                 .compute(method='all_at_once'))
+            .filter("语文", ">=", 0)  # 过滤语文成绩大于等于60的记录
+            .sum(["语文", "数学"])
+            .mean(["化学", "生物", "地理"])
+            .compute(method='all_at_once'))
         
-        # 对比结果
+        
         comparison = result_separate.equals(result_all_at_once)
         print("两种计算方式的结果是否一致:", comparison)
         
-        # 输出结果
+        # **输出计算结果**
         res_dir = "res_dir_avg5"
         os.makedirs(res_dir, exist_ok=True)
-        
-        result_separate.write_csv(os.path.join(res_dir, "result_separate.csv"))
-        result_all_at_once.write_csv(os.path.join(res_dir, "result_all_at_once.csv"))
+        temp_file1 = os.path.join(res_dir, "result_separate.csv")
+        temp_file2 = os.path.join(res_dir, "result_all_at_once.csv")
+
+        result_separate.write_csv(temp_file1)
+        result_all_at_once.write_csv(temp_file2)
+
+        print(f"分步计算结果保存至: {temp_file1}")
+        print(f"一次性计算结果保存至: {temp_file2}")
+
     
     finally:
         # 显式关闭Ray上下文
