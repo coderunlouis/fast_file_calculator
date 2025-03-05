@@ -3,7 +3,7 @@ import random
 import os
 
 # 生成数据的参数
-num_students = 10 * 10000  # 总学生数
+num_students = 1000* 10000  # 总学生数
 num_classes = 1000  # 班级数量
 num_files = 100  # 生成的 CSV 文件数量
 provinces = ["北京", "上海", "广东", "江苏", "浙江", "山东", "四川", "湖北", "湖南", "陕西"]
